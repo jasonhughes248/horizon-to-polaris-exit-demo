@@ -1,0 +1,3 @@
+[tool.pytest.ini_options]
+markers = ["offline: no network or cloud access"]
+testpaths = ["tests"]

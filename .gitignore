@@ -1,0 +1,21 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Generated credentials, baselines, and run results
+state/*
+!state/.gitkeep
+state-archive/
+
+# Python / Spark local artifacts
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# OS
+.DS_Store

@@ -1,0 +1,6 @@
+# Exact versions the demo was verified with.
+pyspark==3.5.3
+snowflake-connector-python==4.8.1  # stay below 5: 5.x does not expand ~ in private_key_file
+boto3==1.43.119
+requests==2.34.2
+pytest==9.1.1
