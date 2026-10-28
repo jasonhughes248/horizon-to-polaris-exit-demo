@@ -11,7 +11,7 @@ Polaris needs is still recoverable without Snowflake:
     mapping (migration/grants.py)
   - principals: saved credentials are reused if they still authenticate; a
     restarted Polaris has no principals, so new credentials are issued and step 7
-    is rerun so Snowflake's catalog integration gets HORIZON_DEMO_RO's new secret
+    is rerun so Snowflake's catalog integration gets HORIZON_DEMO_RW's new secret
 
 Usage: python -m migration.recover_polaris [--force] [--skip-step7]
 """
@@ -179,7 +179,7 @@ def last_committed(default: str) -> str:
 def main(argv: list[str] = ()) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--force", action="store_true", help="re-point an existing registration to the newest metadata")
-    ap.add_argument("--skip-step7", action="store_true", help="do not rerun step 7 when HORIZON_DEMO_RO's secret changed")
+    ap.add_argument("--skip-step7", action="store_true", help="do not rerun step 7 when HORIZON_DEMO_RW's secret changed")
     args = ap.parse_args(list(argv))
 
     n = names()
@@ -204,11 +204,11 @@ def main(argv: list[str] = ()) -> None:
     print(f"recover complete: {n.fqn} registered at metadata seq {_metadata_seq(metadata_location)}, "
           f"{len(identity['snapshot_ids'])} snapshots")
 
-    if "HORIZON_DEMO_RO" in result["rotated"]:
+    if "HORIZON_DEMO_RW" in result["rotated"]:
         if args.skip_step7:
-            print("  NOTE: HORIZON_DEMO_RO has new credentials; rerun step 7: python -m migration.step7_snowflake_via_polaris")
+            print("  NOTE: HORIZON_DEMO_RW has new credentials; rerun step 7: python -m migration.step7_snowflake_via_polaris")
         else:
-            print("  HORIZON_DEMO_RO has new credentials; rerunning step 7 to update Snowflake's catalog integration")
+            print("  HORIZON_DEMO_RW has new credentials; rerunning step 7 to update Snowflake's catalog integration")
             from migration import step7_snowflake_via_polaris
 
             step7_snowflake_via_polaris.main()

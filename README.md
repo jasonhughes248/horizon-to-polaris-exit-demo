@@ -1,8 +1,9 @@
 # horizon-to-polaris-exit
 
 Moves a Snowflake-managed Iceberg table and its access controls from Snowflake Horizon Catalog
-to self-hosted Apache Polaris, without copying data. It then shows that Spark and Snowflake both
-still work against the moved table.
+to self-hosted Apache Polaris, without copying data. Before and after the move, local Spark and
+Snowflake both read and write the same table as the same users, and every row records which
+engine wrote it.
 
 Work through the sections in order: **Prerequisites → One-time setup → Every new shell → Run
 the demo**. Each section assumes the ones before it are done.
@@ -74,30 +75,40 @@ before moving on.
 |---|---|---|
 | 0 | `python -m setup.run_setup` | dedicated S3 bucket, IAM role, external volume, and three users with RBAC (created before the table exists) |
 | 1 | `./cloud/deploy-polaris.sh` | Polaris 1.8.0 on ECS Fargate behind a Caddy HTTPS sidecar (~2 minutes) |
-| 2 | `python -m migration.step2_create_write` | `HORIZON_DEMO_RW` uses local PySpark and Horizon's Iceberg REST endpoint to create a v3 table and write history (appends, update, delete) |
-| 3 | `python -m migration.step3_horizon_demo` | the three users are tried on Horizon (below), then a baseline is recorded |
+| 2 | `python -m migration.step2_create_write` | `HORIZON_DEMO_RW` creates a v3 table from local PySpark through Horizon's Iceberg REST endpoint and writes history (appends, update, delete), then writes more rows from Snowflake SQL; Spark reads Snowflake's rows back |
+| 3 | `python -m migration.step3_horizon_demo` | the three users are tried on Horizon from Spark and from Snowflake (below); both engines must agree on who wrote what; then a baseline is recorded |
 | 4 | `python -m migration.step4_register` | writes are frozen; the database becomes a catalog and the schema a namespace; the table is registered at its existing metadata file; users, roles and grants are recreated in Polaris |
-| 5 | `python -m migration.step5_cutover` | Snowflake's IAM role is denied access to the bucket; once Snowflake's own storage check confirms the deny, `DROP ICEBERG TABLE` in Snowflake |
-| 6 | `python -m migration.step6_polaris_demo` | the same three users are tried on Polaris; identity, history and data are checked; every referenced file must still exist |
-| 7 | `python -m migration.step7_snowflake_via_polaris` | Snowflake reads the table back through Polaris (catalog integration + catalog-linked database) |
+| 5 | `python -m migration.step5_cutover` | Snowflake's IAM role is denied access to the bucket; once Snowflake's own storage check confirms the deny, `DROP ICEBERG TABLE` in Snowflake; the write freeze ends |
+| 6 | `python -m migration.step6_polaris_demo` | the same three users are tried on Polaris from Spark; identity, history and data are checked; every referenced file must still exist; `HORIZON_DEMO_RW` writes new rows from Spark through Polaris |
+| 7 | `python -m migration.step7_snowflake_via_polaris` | Snowflake connects to Polaris (catalog integration + writable catalog-linked database); the three users are tried from Snowflake; `HORIZON_DEMO_RW` writes new rows from Snowflake; both engines must see the same rows from all four writers |
 
 Steps 2–7 also run in one go with `python -m migration.run_all` (`--from N --to M` for a range).
 
 **Reading the output:** each step ends with exactly one line, either `step N complete: ...` or
-`step N FAILED: ...`. That line is the result. Spark prints long Java stack traces at `WARN`
-level that are expected and don't mean failure:
+`step N FAILED: ...`. That line is the result. Above it you'll see Spark's dependency download
+messages, a progress bar, and the step's own tables (access matrices, rows by writer).
 
-- `CommitFailedException ... concurrently modified` followed by `Retrying task after failure`:
-  Iceberg lost a commit race and retried. The step's own checks confirm the final table.
-- `S3Exception ... not authorized to perform: s3:DeleteObject` with `skipping further cleanup`:
-  after that retry, Iceberg couldn't delete the abandoned attempt's file because Horizon's
-  vended write credentials don't allow deletes. It leaves one unreferenced file in S3.
-- In steps 3 and 6, `S3Exception ... PutObject` (or a 403) for `HORIZON_DEMO_RO` or `HORIZON_DEMO_NONE`: that is
-  the access check working. Those users are supposed to be denied.
+Spark's routine stack traces are hidden by `spark/log4j2.properties`:
+
+- Iceberg retrying a commit that lost a race ("concurrently modified"). Iceberg reloads the
+  table and commits again, and the step's own checks confirm the final table.
+- The cleanup after that retry. Horizon's vended credentials don't allow `s3:DeleteObject`, so
+  one unreferenced file is left in S3.
+- Denied writes in the access checks, which are the expected result for `HORIZON_DEMO_RO` and
+  `HORIZON_DEMO_NONE`.
+
+A real failure still stops the step with `FAILED` and the error. To see everything Spark logs,
+set `rootLogger.level = info` and remove the `off` loggers in that file.
+
+Horizon occasionally answers a commit with an unclear result (an HTTP 500, "Indeterminate result
+during conflict resolution check"), even when nothing else is writing. Every write in the demo
+checks the table before trying again, so a write is never applied twice. If that happens you'll
+see one line such as `append 1-1000: the catalog's reply was unclear and the write had not landed;
+retrying`, and the step carries on.
 
 Step 5 is the cutover: Polaris becomes the table's catalog, and Horizon stops managing it. The
-table's data and full history stay in your bucket, untouched, and Snowflake keeps reading the
-table through Polaris (step 7). The cutover removes Snowflake's direct bucket access so that
+table's data and full history stay in your bucket, untouched, and Snowflake keeps reading and
+writing the table through Polaris (step 7). The cutover removes Snowflake's direct bucket access so that
 Horizon's cleanup of a dropped table can't touch files Polaris now owns. To confirm no file was
 removed, leave everything running past the dropped table's retention period (1 day) and run
 `python -m tests.recheck_files`.
@@ -105,8 +116,8 @@ removed, leave everything running past the dropped table's retention period (1 d
 ### Before and after
 
 **After step 3 (before migration):** Horizon is the catalog. Spark connects as each demo user
-with that user's PAT; Snowflake reads the table natively. Storage access goes through Snowflake's
-external volume IAM role.
+with that user's PAT; Snowflake SQL runs as the same users with the same PATs. Storage access goes
+through Snowflake's external volume IAM role.
 
 ```mermaid
 flowchart LR
@@ -116,7 +127,7 @@ flowchart LR
     subgraph sf["Snowflake account"]
         horizon["Horizon Catalog<br/>Iceberg REST endpoint"]
         objs["HORIZON_EXIT_DEMO_DB.DEMO.EVENTS<br/>roles HORIZON_DEMO_RW_ROLE · HORIZON_DEMO_RO_ROLE · HORIZON_DEMO_NONE_ROLE"]
-        wh["Snowflake SQL<br/>(warehouse)"]
+        wh["Snowflake SQL<br/>same three users (PAT auth)"]
         horizon --- objs
         wh --- objs
     end
@@ -127,15 +138,17 @@ flowchart LR
     spark -- "Iceberg REST<br/>(RBAC per user)" --> horizon
     horizon -- "vended credentials" --> spark
     spark -- "read / write files" --> s3
+    wh -- "read / write<br/>(RBAC per user)" --> objs
     objs -- "external volume" --> role
     role -- "read / write" --> s3
 ```
 
 **After step 7 (after migration):** Polaris is the catalog for the same table, pointing at the same
 files. The database, schema, users, roles and grants were recreated as Polaris objects. Spark
-connects as the same three users (now Polaris principals), and Snowflake reads the table through
-Polaris like any other engine. Storage access now goes through Polaris's IAM role; Snowflake's
-own role is denied, so Horizon's cleanup of the dropped table can't touch the files.
+connects as the same three users (now Polaris principals). Snowflake reads and writes the table
+through Polaris like any other engine, and its own grants keep the same three users' rights.
+Storage access now goes through Polaris's IAM role; Snowflake's own role is denied, so Horizon's
+cleanup of the dropped table can't touch the files.
 
 ```mermaid
 flowchart LR
@@ -148,8 +161,10 @@ flowchart LR
         caddy --> polaris
     end
     subgraph sf["Snowflake account"]
-        cld["Catalog-linked database<br/>HORIZON_EXIT_DEMO_POLARIS_DB<br/>(catalog integration as HORIZON_DEMO_RO)"]
+        sfsql["Snowflake SQL<br/>same three users (PAT auth)"]
+        cld["Catalog-linked database<br/>HORIZON_EXIT_DEMO_POLARIS_DB (writable)<br/>catalog integration as HORIZON_DEMO_RW<br/>Snowflake grants per role"]
         horizon["Horizon<br/>(table dropped)"]
+        sfsql -- "read / write<br/>(RBAC per user)" --> cld
     end
     subgraph aws["Your AWS account: storage"]
         prole["IAM role<br/>horizon-to-polaris-exit-polaris-task"]
@@ -163,7 +178,7 @@ flowchart LR
     polaris -. "assumes" .-> prole
     prole -- "read / write" --> s3
     spark -- "read / write files" --> s3
-    cld -- "read files" --> s3
+    cld -- "read / write files" --> s3
     srole -. "denied" .-x s3
     horizon ~~~ srole
 ```
@@ -176,8 +191,33 @@ flowchart LR
 | `HORIZON_DEMO_RO` | yes | yes | yes | no |
 | `HORIZON_DEMO_NONE` | no | no | no | no |
 
-Steps 3 and 6 check this matrix with a separate Spark catalog per user. Both steps must give the
-same result.
+The same matrix is checked four times, and must come out the same each time:
+
+| | Spark | Snowflake |
+|---|---|---|
+| Before (Horizon) | step 3 | step 3 |
+| After (Polaris) | step 6 | step 7 |
+
+Spark uses a separate catalog per user. Snowflake connects as each user with that user's PAT.
+
+### Who wrote what
+
+Every row's `payload` column records the engine and catalog that wrote it, so from step 2 onward
+the table always holds rows from both engines. After step 7, both engines report the same thing:
+
+```text
+Rows by writer (Spark and Snowflake agree)
+  snowflake via horizon      100 rows
+  snowflake via polaris       10 rows
+  spark via horizon         2700 rows
+  spark via polaris           10 rows
+```
+
+To check it yourself in Snowflake:
+
+```sql
+SELECT "payload" AS written_by, COUNT(*) FROM HORIZON_EXIT_DEMO_POLARIS_DB."DEMO"."EVENTS" GROUP BY 1;
+```
 
 ## 5. What moves
 
@@ -208,6 +248,10 @@ same result.
   never contains its value. Principal credentials are written to `state/polaris_principals.json`.
   Rerunning step 4 reuses saved principal credentials while they still authenticate.
   `./cloud/deploy-polaris.sh --rotate-root` issues a new root credential.
+- **Snowflake after the exit:** step 7's catalog integration authenticates to Polaris as the
+  `HORIZON_DEMO_RW` principal, because Snowflake needs a writer. Inside Snowflake, grants on
+  the linked database decide who may use it: `HORIZON_DEMO_RW_ROLE` can read and write,
+  `HORIZON_DEMO_RO_ROLE` can only read, and `HORIZON_DEMO_NONE_ROLE` gets nothing.
 - **Polaris endpoint:** only 80/443 are open (443 is TLS via Caddy). Polaris's plain-HTTP
   port 8181 and its management port 8182 (health and Prometheus metrics; metrics export is a
   Quarkus build-time setting and can't be disabled at runtime) are never opened; the deploy
@@ -234,7 +278,7 @@ same result.
     risk. `state/` is treated as a trusted local anchor.
   - recreates roles and grants from the Snowflake grants recorded in `state/step4_register.json`,
     issues new principal credentials, and reruns step 7 so Snowflake's catalog integration gets
-    HORIZON_DEMO_RO's new secret.
+    HORIZON_DEMO_RW's new secret.
 
   Use Polaris's JDBC metastore for anything beyond a demo.
 - Step 4 never re-points an existing Polaris registration at a different metadata file (that
@@ -244,6 +288,14 @@ same result.
 - Snowflake hides tables a role has no privileges on, even when the role has schema USAGE.
   Polaris `TABLE_LIST` lists every table in the namespace. With one table that both readers can
   query, the two behave the same.
+- Spark runs with Iceberg's vectorized Parquet reader turned off
+  (`spark.sql.iceberg.vectorization.enabled=false` in `spark/sessions.py`). Snowflake writes
+  string columns with `DELTA_LENGTH_BYTE_ARRAY` encoding, which the vectorized reader rejects.
+- The catalog-linked database is writable, and Snowflake passes table drops through to Polaris.
+  Dropping `EVENTS` in `HORIZON_EXIT_DEMO_POLARIS_DB` would drop it from Polaris too. Step 7 and
+  teardown set the database read-only before dropping the database itself.
+- Step 4 freezes writes by disabling `HORIZON_DEMO_RW`, which also disables its PAT. Step 5
+  re-enables both once the table is out of Horizon.
 
 ## 6. Cleanup
 

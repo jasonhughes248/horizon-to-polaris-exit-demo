@@ -7,7 +7,8 @@
     baseline fingerprint (write probes are net-zero)
   - access matrix matches the Horizon matrix
   - every file referenced by any snapshot exists in S3 (HEAD on each object)
-  - HORIZON_DEMO_RW can still commit a write through Polaris
+  - HORIZON_DEMO_RW writes 10 rows from Spark through Polaris ("spark via polaris"),
+    and every reader sees all writers' rows
 
 Usage: python -m migration.step6_polaris_demo
 """
@@ -16,8 +17,11 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from migration.common import RestCatalog, aws_session, fingerprint_sql, names, normalize_fingerprint, read_state, table_identity, write_state
-from spark.sessions import add_polaris_catalogs, spark, table_ref
+from migration.common import (
+    SNOWFLAKE_HORIZON, SPARK_HORIZON, SPARK_POLARIS, WRITER_IDS, RestCatalog, aws_session, fingerprint_sql, names, normalize_fingerprint,
+    print_writer_summary, read_state, table_identity, tagged_rows_sql, write_state, writer_summary, writer_summary_sql,
+)
+from spark.sessions import add_polaris_catalogs, spark, table_ref, write_once
 from tests.access_matrix import mismatches, print_matrix, run_matrix
 
 
@@ -60,6 +64,11 @@ def identity_problems(md: dict, baseline_identity: dict) -> list[str]:
     return bad
 
 
+def pre_exit_rows(t: str) -> str:
+    """Only the rows written before the exit; later steps (and reruns) add their own."""
+    return f"(SELECT * FROM {t} WHERE payload IN ('{SPARK_HORIZON}', '{SNOWFLAKE_HORIZON}')) pre_exit"
+
+
 def main() -> None:
     n = names()
     baseline = read_state("baseline.json")
@@ -70,9 +79,9 @@ def main() -> None:
     loaded = RestCatalog.polaris("ro").load_table(n.schema, n.table)
     identity = table_identity(loaded)
     bad += identity_problems(loaded["metadata"], baseline["identity"])
-    fp = normalize_fingerprint(s.sql(fingerprint_sql(table_ref("polaris_ro"))).collect()[0])
+    fp = normalize_fingerprint(s.sql(fingerprint_sql(pre_exit_rows(table_ref("polaris_ro")))).collect()[0])
     if fp != baseline["fingerprint"]:
-        bad.append(f"fingerprint at head: {baseline['fingerprint']} -> {fp}")
+        bad.append(f"pre-exit rows at head: {baseline['fingerprint']} -> {fp}")
     head = baseline["identity"]["current_snapshot_id"]
     fp_base = normalize_fingerprint(
         s.sql(fingerprint_sql(f"{table_ref('polaris_ro')} VERSION AS OF {head}")).collect()[0])
@@ -93,17 +102,33 @@ def main() -> None:
     matrix = run_matrix(s, "polaris")
     print_matrix("Polaris access (Spark, same users after migration)", matrix)
     bad += mismatches(matrix)
-    fp_after = normalize_fingerprint(s.sql(fingerprint_sql(table_ref("polaris_ro"))).collect()[0])
+    s.sql(f"REFRESH TABLE {table_ref('polaris_ro')}")
+    fp_after = normalize_fingerprint(s.sql(fingerprint_sql(pre_exit_rows(table_ref("polaris_ro")))).collect()[0])
     if fp_after != baseline["fingerprint"]:
-        bad.append(f"fingerprint after write probe (must be net-zero): {fp_after}")
+        bad.append(f"pre-exit rows after write probe (must be net-zero): {fp_after}")
 
-    # The write probe commits through Polaris; remember the catalog's head for recovery.
+    # Spark keeps writing after the exit, through Polaris, as the same user.
+    rw_t = table_ref("polaris_rw")
+    tagged = lambda: s.sql(f"SELECT COUNT(*) FROM {rw_t} WHERE payload = '{SPARK_POLARIS}'").collect()[0][0]  # noqa: E731
+    delete, insert = tagged_rows_sql(rw_t, SPARK_POLARIS, "spark")
+    write_once(s, rw_t, lambda: s.sql(delete), lambda: tagged() == 0, "clear earlier Spark rows")
+    write_once(s, rw_t, lambda: s.sql(insert), lambda: tagged() == WRITER_IDS[SPARK_POLARIS][1], "Spark write via Polaris")
+    s.sql(f"REFRESH TABLE {table_ref('polaris_ro')}")
+    writers = writer_summary(s.sql(writer_summary_sql(table_ref("polaris_ro"))).collect())
+    print_writer_summary("Rows by writer (read by Spark through Polaris)", writers)
+    for w, want in ((SPARK_HORIZON, baseline["writers"][SPARK_HORIZON]),
+                    (SNOWFLAKE_HORIZON, baseline["writers"][SNOWFLAKE_HORIZON]), (SPARK_POLARIS, 10)):
+        if writers.get(w) != want:
+            bad.append(f"'{w}' rows: expected {want}, got {writers.get(w)}")
+
+    # These writes commit through Polaris; remember the catalog's head for recovery.
     head = RestCatalog.polaris("ro").load_table(n.schema, n.table).get("metadata-location")
     if head:
         write_state("last_committed.json", {"metadata_location": head})
     write_state("step6_polaris_demo.json", {
         "identity": identity, "fingerprint": fp, "first_snapshot_rows": first_count,
         "referenced_files": len(files), "missing_files": missing, "polaris_matrix": matrix,
+        "writers": writers,
     })
     if bad:
         raise SystemExit("step 6 FAILED:\n  " + "\n  ".join(bad))

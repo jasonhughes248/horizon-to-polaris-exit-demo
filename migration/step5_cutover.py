@@ -3,6 +3,7 @@
   1. Deny Snowflake's IAM role all access to the bucket
   2. Wait until the deny is in effect: SYSTEM$VERIFY_EXTERNAL_VOLUME must fail
   3. Only then DROP ICEBERG TABLE in Snowflake (removes it from Horizon)
+  4. End step 4's write freeze: re-enable HORIZON_DEMO_RW, who now writes through Polaris
 
 Order matters: Snowflake deletes files of a dropped table it considers its own (after the
 retention period). Denying first means there is no moment at which the table is dropped
@@ -17,7 +18,7 @@ from __future__ import annotations
 import json
 import time
 
-from migration.common import aws_session, env, names, run_sql, snowflake_admin, write_state
+from migration.common import DEMO_USERS, PAT_NAME, aws_session, env, names, run_sql, snowflake_admin, write_state
 
 DENY_POLICY = "horizon-exit-demo-deny"
 
@@ -74,6 +75,11 @@ def main() -> None:
 
     # Written only after the DROP succeeds: step 4 and recovery treat this file as "cut over".
     write_state("step5_cutover.json", {"revoked_at": revoked_at, "dropped_at": dropped_at, "verify_after_revoke": verify})
+    # Horizon no longer has the table, so the freeze is over; writes now go through Polaris.
+    # Disabling a user also disables its PATs, and re-enabling the user does not restore them.
+    rw_user = DEMO_USERS["rw"]["user"]
+    run_sql(conn, [f"ALTER USER {rw_user} SET DISABLED = FALSE",
+                   f"ALTER USER {rw_user} MODIFY PROGRAMMATIC ACCESS TOKEN {PAT_NAME} SET DISABLED = FALSE"])
     print(f"step 5 complete: Snowflake denied bucket access, then table dropped ({dropped_at - revoked_at:.0f}s later)")
 
 

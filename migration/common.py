@@ -13,6 +13,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -141,6 +142,22 @@ def snowflake_admin(role: str = ADMIN_ROLE):
     conn = snowflake.connector.connect(connection_name=env("SNOWFLAKE_CONNECTION_NAME"))
     conn.cursor().execute(f"USE ROLE {role}")
     return conn
+
+
+def snowflake_as(user_key: str):
+    """Connector session as a demo user, authenticated with that user's PAT."""
+    import snowflake.connector
+
+    host = urlparse(env("SNOWFLAKE_ACCOUNT_URL")).netloc or env("SNOWFLAKE_ACCOUNT_URL")
+    u = DEMO_USERS[user_key]
+    return snowflake.connector.connect(
+        account=host.split(".snowflakecomputing")[0],
+        user=u["user"],
+        role=u["role"],
+        authenticator="PROGRAMMATIC_ACCESS_TOKEN",
+        token=pats()[user_key],
+        warehouse=names().warehouse,
+    )
 
 
 def run_sql(conn, statements: list[str], echo: bool = True) -> list[list[tuple]]:
@@ -275,3 +292,47 @@ def normalize_fingerprint(row) -> dict:
         else:
             out[key] = int(value) if value is not None else None
     return out
+
+
+# ── Who wrote what ───────────────────────────────────────────────────────────
+# Every row's payload records the engine and catalog that wrote it. Each group
+# has its own id range, so the groups never overlap.
+SPARK_HORIZON = "spark via horizon"          # step 2, ids 1-3000
+SNOWFLAKE_HORIZON = "snowflake via horizon"  # step 2, ids 5001-5100
+SPARK_POLARIS = "spark via polaris"          # step 6, ids 6001-6010
+SNOWFLAKE_POLARIS = "snowflake via polaris"  # step 7, ids 7001-7010
+WRITER_IDS = {SNOWFLAKE_HORIZON: (5001, 100), SPARK_POLARIS: (6001, 10), SNOWFLAKE_POLARIS: (7001, 10)}
+
+
+def writer_summary_sql(table_ref: str, quote: str = "") -> str:
+    p = f"{quote}payload{quote}"
+    return f"SELECT {p} AS written_by, COUNT(*) AS row_count FROM {table_ref} GROUP BY {p} ORDER BY {p}"
+
+
+def writer_summary(rows) -> dict:
+    return {str(r[0]): int(r[1]) for r in rows}
+
+
+def print_writer_summary(title: str, summary: dict) -> None:
+    print(f"\n{title}")
+    for writer, count in summary.items():
+        print(f"  {writer:<24}{count:>6} rows")
+
+
+def tagged_rows_sql(table_ref: str, writer: str, dialect: str) -> list[str]:
+    """Delete-then-insert of `writer`'s rows, so reruns don't add duplicates.
+
+    dialect 'spark' or 'snowflake' (Snowflake needs quoted lowercase column names).
+    """
+    start, count = WRITER_IDS[writer]
+    q = '"' if dialect == "snowflake" else ""
+    ts = (lambda v: f"'{v}'::TIMESTAMP_NTZ") if dialect == "snowflake" else (lambda v: f"TIMESTAMP_NTZ '{v}'")
+    values = ", ".join(
+        f"({i}, {ts(f'2026-06-01 00:{(i - start) % 60:02d}:00')}, 'write', {i % 100}.50, '{writer}')"
+        for i in range(start, start + count)
+    )
+    cols = ", ".join(f"{q}{c}{q}" for c in ("id", "event_ts", "category", "amount", "payload"))
+    return [
+        f"DELETE FROM {table_ref} WHERE {q}payload{q} = '{writer}'",
+        f"INSERT INTO {table_ref} ({cols}) VALUES {values}",
+    ]

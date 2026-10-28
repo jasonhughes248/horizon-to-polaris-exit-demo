@@ -91,9 +91,14 @@ def setup_aws() -> str:
     try:
         role_arn = iam.get_role(RoleName=role_name)["Role"]["Arn"]
     except iam.exceptions.NoSuchEntityException:
-        print(f"  aws> create role {role_name} (placeholder trust; fixed after DESC EXTERNAL VOLUME)")
+        # A fresh IAM path per run gives the role a new ARN. Snowflake caches credentials per
+        # role ARN, so reusing the ARN of a role deleted by teardown fails with
+        # "The AWS Access Key Id you provided is not valid" until that cache expires.
+        path = f"/horizon-to-polaris-exit/run-{int(time.time())}/"
+        print(f"  aws> create role {role_name} at {path} (placeholder trust; fixed after DESC EXTERNAL VOLUME)")
         role_arn = iam.create_role(
             RoleName=role_name,
+            Path=path,
             AssumeRolePolicyDocument=json.dumps(trust_policy(f"arn:aws:iam::{account}:root")),
             Tags=[{"Key": "project", "Value": "horizon-to-polaris-exit"}],
         )["Role"]["Arn"]
@@ -123,6 +128,10 @@ def setup_external_volume(conn, role_arn: str) -> None:
     ])
     desc = query_dicts(conn, f"DESC EXTERNAL VOLUME {n.external_volume}")
     loc = next(json.loads(r["property_value"]) for r in desc if r["property"].startswith("STORAGE_LOCATION_1"))
+    if loc.get("STORAGE_AWS_ROLE_ARN") != role_arn:
+        raise SystemExit(
+            f"step 0 FAILED: external volume {n.external_volume} points at {loc.get('STORAGE_AWS_ROLE_ARN')}, "
+            f"but the IAM role is now {role_arn}. Run ./cloud/teardown.sh --all, then step 0 again.")
     sf_principal = loc["STORAGE_AWS_IAM_USER_ARN"]
 
     iam = aws_session().client("iam")
@@ -162,7 +171,9 @@ def rbac_statements(cidr: str) -> list[str]:
         f"GRANT USAGE ON DATABASE {n.database} TO ROLE {ro}",
         f"GRANT USAGE ON SCHEMA {schema} TO ROLE {ro}",
         f"GRANT SELECT ON FUTURE ICEBERG TABLES IN SCHEMA {schema} TO ROLE {ro}",
-        # HORIZON_DEMO_NONE_ROLE: intentionally nothing
+        # HORIZON_DEMO_NONE_ROLE: no data privileges at all
+        # Every demo role may run queries, so a Snowflake denial is about the table, not compute.
+        *[f"GRANT USAGE ON WAREHOUSE {n.warehouse} TO ROLE {r}" for r in (rw, ro, none)],
         f"CREATE NETWORK POLICY IF NOT EXISTS {NETWORK_POLICY} ALLOWED_IP_LIST = ('{cidr}')",
         f"ALTER NETWORK POLICY {NETWORK_POLICY} SET ALLOWED_IP_LIST = ('{cidr}')",
     ]

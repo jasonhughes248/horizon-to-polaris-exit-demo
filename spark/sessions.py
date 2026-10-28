@@ -10,11 +10,14 @@ step 4 creates the principals (Spark accepts catalog config at runtime).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pyspark.sql import SparkSession
 
 from migration.common import DEMO_USERS, env, has_state, horizon_uri, names, pats, polaris_principals, polaris_uri
 
 _spark: SparkSession | None = None
+LOG_CONFIG = Path(__file__).resolve().parent / "log4j2.properties"
 
 
 def _packages() -> str:
@@ -27,6 +30,7 @@ def _rest_conf(name: str, uri: str, warehouse: str, credential: str, scope: str)
     return {
         p: "org.apache.iceberg.spark.SparkCatalog",
         f"{p}.type": "rest",
+        f"{p}.rest.auth.type": "oauth2",
         f"{p}.uri": uri,
         f"{p}.oauth2-server-uri": f"{uri}/v1/oauth/tokens",
         f"{p}.warehouse": warehouse,
@@ -68,7 +72,12 @@ def spark() -> SparkSession:
             .config("spark.jars.packages", _packages())
             .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
             .config("spark.sql.session.timeZone", "UTC")
+            # Snowflake writes strings with DELTA_LENGTH_BYTE_ARRAY encoding, which Iceberg's
+            # vectorized Parquet reader rejects; the row-based reader handles it.
+            .config("spark.sql.iceberg.vectorization.enabled", "false")
             .config("spark.ui.enabled", "false")
+            # Hide Spark's routine retry and expected-denial stack traces (see the file).
+            .config("spark.driver.extraJavaOptions", f'"-Dlog4j2.configurationFile=file:{LOG_CONFIG}"')
             # local mode only: avoid binding the driver to a LAN/VPN address
             .config("spark.driver.host", "127.0.0.1")
             .config("spark.driver.bindAddress", "127.0.0.1")
@@ -76,7 +85,6 @@ def spark() -> SparkSession:
         for k, v in horizon_conf().items():
             builder = builder.config(k, v)
         _spark = builder.getOrCreate()
-        _spark.sparkContext.setLogLevel("WARN")
         if has_state("polaris_principals.json"):
             add_polaris_catalogs()
     return _spark
@@ -91,3 +99,29 @@ def add_polaris_catalogs() -> None:
 def table_ref(catalog: str) -> str:
     n = names()
     return f"{catalog}.{n.schema}.{n.table}"
+
+
+# Horizon occasionally answers a commit with a 500 ("Indeterminate result during conflict
+# resolution check") or a conflict that Iceberg's own retries don't resolve. A blind retry
+# could apply a write twice, so each write comes with a check of whether it already landed.
+RETRYABLE = ("CommitStateUnknownException", "CommitFailedException", "Indeterminate result", "concurrently modified")
+
+
+def write_once(s, table: str, write, landed, label: str, attempts: int = 4) -> None:
+    """Run `write()` until `landed()` is true, re-checking the table after any unclear commit."""
+    import time
+
+    for attempt in range(1, attempts + 1):
+        try:
+            write()
+            return
+        except Exception as exc:  # noqa: BLE001 - Py4J wraps the Java exception
+            text = str(exc)
+            if not any(m in text for m in RETRYABLE) or attempt == attempts:
+                raise
+            time.sleep(2 * attempt)
+            s.sql(f"REFRESH TABLE {table}")
+            if landed():
+                print(f"  {label}: the catalog's reply was unclear, but the write had landed")
+                return
+            print(f"  {label}: the catalog's reply was unclear and the write had not landed; retrying")
