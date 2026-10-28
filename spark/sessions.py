@@ -21,7 +21,7 @@ LOG_CONFIG = Path(__file__).resolve().parent / "log4j2.properties"
 
 
 def _packages() -> str:
-    v = env("ICEBERG_VERSION", "1.10.0")
+    v = env("ICEBERG_VERSION", "1.12.0")
     return f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{v},org.apache.iceberg:iceberg-aws-bundle:{v}"
 
 
@@ -72,9 +72,9 @@ def spark() -> SparkSession:
             .config("spark.jars.packages", _packages())
             .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
             .config("spark.sql.session.timeZone", "UTC")
-            # Snowflake writes strings with DELTA_LENGTH_BYTE_ARRAY encoding, which Iceberg's
-            # vectorized Parquet reader rejects; the row-based reader handles it.
-            .config("spark.sql.iceberg.vectorization.enabled", "false")
+            # Snowflake writes strings with DELTA_LENGTH_BYTE_ARRAY encoding; Iceberg's vectorized
+            # Parquet reader handles it from Iceberg 1.11.0 (apache/iceberg#15362).
+            .config("spark.sql.iceberg.vectorization.enabled", "true")
             .config("spark.ui.enabled", "false")
             # Hide Spark's routine retry and expected-denial stack traces (see the file).
             .config("spark.driver.extraJavaOptions", f'"-Dlog4j2.configurationFile=file:{LOG_CONFIG}"')

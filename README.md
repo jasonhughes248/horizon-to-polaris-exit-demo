@@ -288,9 +288,10 @@ SELECT "payload" AS written_by, COUNT(*) FROM HORIZON_EXIT_DEMO_POLARIS_DB."DEMO
 - Snowflake hides tables a role has no privileges on, even when the role has schema USAGE.
   Polaris `TABLE_LIST` lists every table in the namespace. With one table that both readers can
   query, the two behave the same.
-- Spark runs with Iceberg's vectorized Parquet reader turned off
-  (`spark.sql.iceberg.vectorization.enabled=false` in `spark/sessions.py`). Snowflake writes
-  string columns with `DELTA_LENGTH_BYTE_ARRAY` encoding, which the vectorized reader rejects.
+- Keep `ICEBERG_VERSION` at 1.11.0 or later. Snowflake writes string columns with
+  `DELTA_LENGTH_BYTE_ARRAY` encoding, and Iceberg's vectorized Parquet reader (on in
+  `spark/sessions.py`) supports that encoding only from 1.11.0. With an older Iceberg, Spark
+  fails to read Snowflake's rows.
 - The catalog-linked database is writable, and Snowflake passes table drops through to Polaris.
   Dropping `EVENTS` in `HORIZON_EXIT_DEMO_POLARIS_DB` would drop it from Polaris too. Step 7 and
   teardown set the database read-only before dropping the database itself.
